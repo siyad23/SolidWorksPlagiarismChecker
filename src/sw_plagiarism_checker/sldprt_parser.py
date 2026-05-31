@@ -1,8 +1,9 @@
 """
 sldprt_parser.py  —  SolidWorks COM API edition
 ================================================
-Extracts rich data from SolidWorks .SLDPRT files using the SolidWorks COM API
-(win32com / pywin32).  Requires SolidWorks to be installed on the machine.
+Extracts rich data from SolidWorks .SLDPRT and .SLDASM files using the
+SolidWorks COM API (win32com / pywin32).  Requires SolidWorks to be
+installed on the machine.
 
 Extracted data per file
 -----------------------
@@ -15,6 +16,9 @@ Extracted data per file
 - SW version     : SolidWorks version that last saved the file
 - Fingerprints   : SHA-256 of full file, feature-sequence hash,
                    geometry fingerprint (mass props hash), custom-props hash
+- Uploader       : student name extracted from OLE author / email metadata
+
+Supported extensions: .sldprt (parts), .sldasm (assemblies)
 """
 
 import os
@@ -71,6 +75,48 @@ def _safe_float(val, default=0.0):
         return float(val)
     except Exception:
         return default
+
+
+def _extract_uploader_name(ole_meta, custom_props=None):
+    """
+    Extract the student / uploader name from OLE metadata.
+    Strategy:
+      1. If 'author' looks like an email, extract the name part.
+      2. Otherwise use 'author' directly.
+      3. Fallback to custom props like 'DrawnBy', 'Designer', etc.
+    """
+    import re as _re
+
+    candidates = []
+
+    for key in ("author", "last_author"):
+        raw = ole_meta.get(key)
+        if not raw:
+            continue
+        raw = raw.strip()
+        # Educational email pattern  e.g. john.doe@university.edu
+        email_match = _re.match(r'^([^@]+)@', raw)
+        if email_match:
+            local = email_match.group(1)
+            # Turn john.doe or john_doe into John Doe
+            name = _re.sub(r'[._]', ' ', local).strip().title()
+            if name:
+                candidates.append(name)
+        elif len(raw) < 80:
+            candidates.append(raw)
+
+    # Check custom properties for designer/author fields
+    if custom_props:
+        for pkey in ("DrawnBy", "Drawn By", "Designer", "Author", "CreatedBy", "Created By"):
+            val = custom_props.get(pkey, "").strip()
+            if val and len(val) < 80:
+                candidates.append(val)
+
+    return candidates[0] if candidates else None
+
+
+# Supported file extensions
+SUPPORTED_EXTENSIONS = {".sldprt", ".sldasm"}
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +191,14 @@ def _get_ole_metadata(path):
 # ---------------------------------------------------------------------------
 
 swDocPART               = 1
+swDocASSEMBLY           = 2
 swOpenDocOptions_Silent  = 1
 swOpenDocOptions_ReadOnly = 2
+
+_EXT_TO_DOCTYPE = {
+    ".sldprt": swDocPART,
+    ".sldasm": swDocASSEMBLY,
+}
 
 
 def _connect_solidworks():
@@ -167,8 +219,104 @@ def _connect_solidworks():
         )
 
 
+def _extract_feature_params(ftype, feat_def):
+    """
+    Extract key dimensional parameters from a SolidWorks feature definition.
+    Returns a dict of parameter_name → float_value.
+    Each feature type has different accessible properties.
+    """
+    params = {}
+    try:
+        # Boss-Extrude / Cut-Extrude
+        if ftype in ("ICE", "ICut", "Boss-Extrude", "Cut-Extrude",
+                       "Extrusion", "ExtrudedBoss", "ExtrudedCut"):
+            try:
+                params["depth"] = _safe_float(feat_def.GetDepth(True))
+            except Exception:
+                pass
+            try:
+                params["draft_angle"] = _safe_float(feat_def.GetDraftAngle())
+            except Exception:
+                pass
+
+        # Fillet
+        elif ftype in ("Fillet", "ConstRadiusFillet", "VarRadiusFillet"):
+            try:
+                params["radius"] = _safe_float(feat_def.DefaultRadius)
+            except Exception:
+                pass
+
+        # Chamfer
+        elif ftype in ("Chamfer",):
+            try:
+                params["width"] = _safe_float(feat_def.Width)
+            except Exception:
+                pass
+            try:
+                params["angle"] = _safe_float(feat_def.Angle)
+            except Exception:
+                pass
+
+        # Revolution / Revolve
+        elif ftype in ("Revolution", "RevolveBoss", "RevolveCut",
+                         "Revolve", "RevolvedBoss", "RevolvedCut"):
+            try:
+                params["angle"] = _safe_float(feat_def.GetRevolutionAngle())
+            except Exception:
+                pass
+
+        # Hole Wizard
+        elif ftype in ("HoleWzd", "HoleWizard"):
+            try:
+                params["diameter"] = _safe_float(feat_def.Diameter)
+            except Exception:
+                pass
+            try:
+                params["depth"] = _safe_float(feat_def.Depth)
+            except Exception:
+                pass
+
+        # Shell
+        elif ftype in ("Shell",):
+            try:
+                params["thickness"] = _safe_float(feat_def.Thickness)
+            except Exception:
+                pass
+
+        # Linear Pattern
+        elif ftype in ("LPattern", "LinearPattern"):
+            try:
+                params["d1_spacing"] = _safe_float(feat_def.D1Spacing)
+            except Exception:
+                pass
+            try:
+                params["d1_num"] = _safe_float(feat_def.D1TotalInstances)
+            except Exception:
+                pass
+
+        # Circular Pattern
+        elif ftype in ("CirPattern", "CircularPattern"):
+            try:
+                params["spacing_angle"] = _safe_float(feat_def.Spacing)
+            except Exception:
+                pass
+            try:
+                params["total_instances"] = _safe_float(feat_def.TotalInstances)
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+    # Filter out zero/invalid values
+    return {k: v for k, v in params.items() if v != 0.0}
+
+
 def _extract_via_com(path):
-    """Open SLDPRT via SolidWorks COM API and extract all data."""
+    """Open SLDPRT/SLDASM via SolidWorks COM API and extract all data."""
+    ext = os.path.splitext(path)[1].lower()
+    doc_type = _EXT_TO_DOCTYPE.get(ext, swDocPART)
+
     result = {
         "features": [], "mass_props": {}, "custom_props": {},
         "sw_metadata": {}, "config_name": None, "sw_version": None,
@@ -185,7 +333,7 @@ def _extract_via_com(path):
         errors   = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         doc = swApp.OpenDoc6(
-            path, swDocPART,
+            path, doc_type,
             swOpenDocOptions_Silent | swOpenDocOptions_ReadOnly,
             "", errors, warnings
         )
@@ -230,15 +378,27 @@ def _extract_via_com(path):
                     except Exception:
                         pass
 
+                    # ---- Feature parameter extraction (Improvement 7) ----
+                    params = {}
+                    try:
+                        feat_def = feat.GetDefinition()
+                        if feat_def is not None:
+                            params = _extract_feature_params(ftype, feat_def)
+                    except Exception:
+                        pass
+
                     key = f"{fname}::{ftype}"
                     if key not in seen:
                         seen.add(key)
-                        feature_list.append({
+                        feature_entry = {
                             "name": fname,
                             "type": ftype,
                             "suppressed": fsuppressed,
                             "created_by": created_by,
-                        })
+                        }
+                        if params:
+                            feature_entry["params"] = params
+                        feature_list.append(feature_entry)
                         if created_by and created_by not in result["authors"]:
                             result["authors"].append(created_by)
                 except Exception:
@@ -396,22 +556,33 @@ def _compute_fingerprints(data):
 # Main public function
 # ---------------------------------------------------------------------------
 
-def parse_sldprt(filepath):
+def parse_sw_file(filepath):
     """
-    Parse a SolidWorks .SLDPRT file using the SolidWorks COM API.
+    Parse a SolidWorks .SLDPRT or .SLDASM file.
 
     Returns a dict with:
-        file_path, file_name, fs_metadata, ole_metadata,
+        file_path, file_name, file_type, fs_metadata, ole_metadata,
         features, mass_props, custom_props, sw_metadata,
-        config_name, sw_version, authors, fingerprints,
-        feature_type_counts, feature_count,
+        config_name, sw_version, authors, uploader_name,
+        fingerprints, feature_type_counts, feature_count,
         full_hash, parse_error
     """
     filepath = os.path.abspath(filepath)
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext not in SUPPORTED_EXTENSIONS:
+        return {
+            "file_path": filepath,
+            "file_name": os.path.basename(filepath),
+            "file_type": ext,
+            "parse_error": f"Unsupported file extension: {ext}. "
+                           f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}",
+        }
 
     result = {
         "file_path":    filepath,
         "file_name":    os.path.basename(filepath),
+        "file_type":    ext,
         "fs_metadata":  {},
         "ole_metadata": {},
         "features":     [],
@@ -421,6 +592,7 @@ def parse_sldprt(filepath):
         "config_name":  None,
         "sw_version":   None,
         "authors":      [],
+        "uploader_name": None,
         "fingerprints": {},
         "feature_type_counts": {},
         "feature_count": 0,
@@ -478,4 +650,15 @@ def parse_sldprt(filepath):
     result["feature_type_counts"] = result["fingerprints"]["feature_type_counts"]
     result["feature_count"]       = result["fingerprints"]["feature_count"]
 
+    # Extract uploader / student name from metadata
+    result["uploader_name"] = _extract_uploader_name(
+        result["ole_metadata"], result["custom_props"]
+    )
+
     return result
+
+
+# Backward-compatible alias
+def parse_sldprt(filepath):
+    """Alias for parse_sw_file (backward compatibility)."""
+    return parse_sw_file(filepath)

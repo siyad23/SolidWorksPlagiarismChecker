@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./web/uploads:/app/web/uploads
+      - ./web/reports:/app/web/reports
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped

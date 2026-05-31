@@ -25,3 +25,27 @@ venv.bak/
 # IDEs
 .vscode/
 .idea/
+
+# Google Drive credentials (SENSITIVE — never commit)
+credentials.json
+token.json
+
+# Generated reports
+reports/
+
+# Uploaded files (web app)
+web/uploads/
+web/reports/
+
+# SolidWorks files (test data)
+*.sldprt
+*.sldasm
+*.SLDPRT
+*.SLDASM
+
+# Docker
+.dockerignore
+
+# OS
+Thumbs.db
+.DS_Store
